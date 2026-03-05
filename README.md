@@ -47,7 +47,7 @@ It can run entirely on a local model through Ollama (zero data leaves your machi
 
 ## Screenshots
 
-> Replace each image with a smartphone mockup screenshot. See [`.github/assets/PLACEHOLDER_GUIDE.md`](.github/assets/PLACEHOLDER_GUIDE.md) for filenames and dimensions.
+
 
 <div align="center">
 <table>
