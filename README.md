@@ -42,6 +42,8 @@ It can run entirely on a local model through Ollama (zero data leaves your machi
 | **Agent Tools** | Subagent spawning, MCP server integration, custom skills |
 | **Memory** | Persistent conversation history, user profile, session consolidation |
 | **Transcription** | Voice message transcription via Groq Whisper |
+| **Activity Journal** | Timestamped log of every conversation turn, queryable by natural language time expressions |
+| **System Monitor** | Real-time file system watcher — tracks every file created, modified, deleted, or renamed across watched paths with content extraction for text, PDF, and DOCX |
 
 <br/>
 
@@ -372,6 +374,51 @@ Routes tool calls to external MCP server processes over stdio JSON-RPC 2.0. Tool
 ### Custom Skills
 Any executable in `~/.panther/skills/` is registered as a callable tool. Input via `PANTHER_INPUT` env var, output via stdout, 30-second timeout.
 
+### Activity Journal
+Every conversation turn — user message and agent reply — is appended to an append-only NDJSON log at `~/.panther/workspace/activity_journal.ndjson`. Each record carries a UTC timestamp, session key, role, and content. The `query_activity` tool exposes this log to the agent, accepting free-form natural language time expressions and returning all matching records within a configurable time window.
+
+**Supported time expressions (non-exhaustive):**
+
+| Expression | Meaning |
+|---|---|
+| `1 hour ago` | 60 minutes before now |
+| `2pm yesterday` | 14:00 the previous calendar day |
+| `3 days ago` | Same time of day, 3 days back |
+| `5 days ago at 3pm` | 15:00 five calendar days ago |
+| `this morning` | 09:00 today |
+| `this afternoon` | 14:00 today |
+| `a week ago` | 7 days before now |
+| `30 minutes ago` | 30 minutes before now |
+| `two hours ago` | Word numbers are resolved |
+
+The `window_minutes` parameter (default 60, max 1440) controls the width of the search window centred on the resolved anchor time.
+
+### System Monitor
+A background file system watcher that records every file event on your machine into the same activity journal. Uses the OS-native watch API on each platform — `inotify` on Linux, `FSEvents` on macOS, `ReadDirectoryChangesW` on Windows — via the `notify` crate, with no polling overhead.
+
+**What it captures:**
+
+| Event | Description |
+|---|---|
+| `CREATED` | New file or directory appeared at a path |
+| `MODIFIED` | File content changed (write saves, edits, overwrites) |
+| `DELETED` | File or directory removed |
+| `RENAMED` | File or directory moved or renamed |
+
+Access-time and metadata-only events are intentionally ignored to avoid noise from routine file reads.
+
+**Content extraction** is performed automatically for supported file types when a file is created or modified:
+
+| Format | Method |
+|---|---|
+| Plain text, code, config, data | UTF-8 read, truncated to `max_content_chars` |
+| PDF | Pure-Rust `lopdf` parser — no external binary required |
+| DOCX | ZIP extraction + `quick-xml` parsing of `word/document.xml` |
+
+**Debouncing** collapses rapid bursts of events on the same path (e.g. autosave firing 20 times per second) into a single record. The default debounce window is 500 ms and is configurable.
+
+**Self-exclusion** — the `~/.panther/` directory is always excluded from watching to prevent journal writes from generating new journal events.
+
 <br/>
 
 ---
@@ -586,6 +633,25 @@ send_tool_hints         = false   # Annotate responses with tool names used
 groq_transcription_key = ""
 transcription_model    = "whisper-large-v3"
 
+# ── System Monitor ────────────────────────────────────────────────────────────
+# Watches file system paths and records every create/modify/delete/rename event
+# into the activity journal so the agent can answer "what did I do at X time?"
+[system_monitor]
+enabled            = false
+watch_paths        = ["~/Desktop", "~/Documents"]    # Paths to watch recursively
+debounce_ms        = 500     # Collapse rapid events on the same file into one record
+max_content_chars  = 800     # Max chars of file content captured per event
+
+# Extensions for which file content is extracted and stored with the event.
+# PDF and DOCX are parsed natively (no external binary needed).
+# Remove any extension to skip content capture for that type.
+content_extensions = [
+  "txt", "md", "rs", "toml", "json", "yaml", "yml",
+  "py", "js", "ts", "html", "css", "csv", "xml", "log",
+  "sh", "conf", "ini", "env", "sql", "go", "c", "cpp",
+  "h", "java", "kt", "swift", "rb", "php", "pdf", "docx"
+]
+
 # ── MCP Servers ───────────────────────────────────────────────────────────────
 [[mcp_servers]]
 name    = "filesystem"
@@ -746,12 +812,19 @@ chmod +x ~/.panther/skills/weather.py
 ├── history/                  # Per-session conversation logs (JSON)
 ├── chats/
 │   └── known_chats.json      # channel:chat_id to session ID map
-└── skills/                   # Custom skill scripts
+├── skills/                   # Custom skill scripts
+└── workspace/
+    ├── activity_journal.ndjson   # Append-only timestamped log of all activity
+    └── memory/
+        ├── MEMORY.md             # Long-term consolidated memory
+        └── HISTORY.md            # Summarised session history entries
 ```
 
 The user profile is injected into the system prompt on every turn, so the agent maintains consistent knowledge of your preferences and projects across sessions and restarts.
 
 When a session's history grows large, the agent runs a consolidation pass that summarises older exchanges into a compact form, keeping context size manageable without losing important facts.
+
+The activity journal grows continuously as long as the daemon is running. Every user message, agent reply, and file system event (when system monitor is enabled) is appended as a single JSON line with a UTC timestamp. The journal is never truncated automatically — manage its size manually if needed by archiving or deleting the file; a new one will be created on next write.
 
 <br/>
 
@@ -770,6 +843,112 @@ When a session's history grows large, the agent runs a consolidation pass that s
 | MCP / skill tool overhead | 100-500 ms (subprocess IPC) |
 
 Set `send_progress = true` to receive intermediate status messages during long tool chains so the chat does not go silent while work is happening.
+
+<br/>
+
+---
+
+## Activity Intelligence
+
+Panther maintains a continuous, queryable record of everything that happens on your machine while the daemon is running. This is composed of two complementary subsystems that feed a single shared log.
+
+### How It Works
+
+Every event — whether a message you sent, a reply the agent produced, or a file that changed on your filesystem — is appended as a single JSON line to `~/.panther/workspace/activity_journal.ndjson`. Each line carries:
+
+```json
+{
+  "timestamp": "2025-03-07T14:23:11.042Z",
+  "session_key": "telegram:123456789",
+  "role": "user",
+  "content": "..."
+}
+```
+
+The `role` field is one of `user`, `agent`, or `system`. Conversation turns use `user` and `agent`. File system events use `system`.
+
+The `query_activity` tool is registered alongside all other built-in tools. When you ask a time-based question, the agent calls it automatically — no special command or syntax needed.
+
+### Conversation Timeline
+
+Every message you send and every reply the agent produces is recorded with a precise UTC timestamp at the moment of processing. The record captures the full content of each turn, truncated at 512 characters to keep the journal compact.
+
+**Example queries:**
+```
+What did we talk about this morning?
+What was I asking you about 2 hours ago?
+What did you help me with yesterday afternoon?
+Summarise our conversation from 3 days ago.
+```
+
+### File System Timeline
+
+When `[system_monitor] enabled = true`, a background watcher attaches to every path listed in `watch_paths` and streams file events into the same journal. Events are recorded with the full path, event type, file extension, file size, and a content preview for supported formats.
+
+**Example queries:**
+```
+What files did I create on my Desktop in the last hour?
+What was I working on yesterday at 2pm?
+Give me a summary of everything I changed in ~/Projects this morning.
+What did I write in that document 3 days ago?
+Did I delete anything on my Desktop last week?
+What files changed in the last 30 minutes?
+```
+
+### Time Window Mechanics
+
+Every query resolves to an anchor timestamp and a symmetric window around it. The default window is 60 minutes (30 minutes before and after the anchor). Pass `window_minutes` to widen or narrow it.
+
+```
+"1 hour ago"          → anchor: now - 1h,  window: ±30 min
+"2pm yesterday"       → anchor: yesterday 14:00, window: ±30 min
+"3 days ago"          → anchor: 3 days back at noon, window: ±30 min
+"5 days ago at 3pm"   → anchor: 5 days back at 15:00, window: ±30 min
+```
+
+If results are sparse, ask the agent to widen the window: *"check the last 3 hours around that time"*.
+
+### Query Response Structure
+
+Results are split into two labelled sections:
+
+```
+=== CONVERSATION (4 messages) ===
+
+[2025-03-07 14:21:03] [user]
+What files did I create earlier?
+
+[2025-03-07 14:21:09] [agent]
+I'll check the activity journal for you...
+
+=== FILE SYSTEM EVENTS (7 events) ===
+
+[2025-03-07 14:15:42]
+action: CREATED
+path: /home/user/Desktop/report.docx
+type: docx
+size: 0 bytes
+
+[2025-03-07 14:18:03]
+action: MODIFIED
+path: /home/user/Desktop/report.docx
+type: docx
+size: 14823 bytes
+content_preview:
+Q1 Financial Summary
+
+Total revenue for the quarter reached...
+```
+
+### Platform Support
+
+The file system watcher uses the OS-native kernel API on every platform. There is no polling. Events arrive in real time with sub-second latency.
+
+| Platform | Kernel API | Crate backend |
+|---|---|---|
+| Linux | inotify | `notify` (inotify backend) |
+| macOS | FSEvents | `notify` (kqueue/FSEvents backend) |
+| Windows | ReadDirectoryChangesW | `notify` (windows backend) |
 
 <br/>
 

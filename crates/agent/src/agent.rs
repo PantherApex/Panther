@@ -38,6 +38,7 @@ pub struct Agent {
     consolidating: Arc<Mutex<HashSet<String>>>,
     active_tasks: Arc<Mutex<HashMap<String, Vec<TaskHandle>>>>,
     session_locks: Arc<Mutex<HashMap<String, Arc<Semaphore>>>>,
+    pub last_active_session: Arc<Mutex<Option<(String, String)>>>,
     pub subagents: Option<Arc<SubagentManager>>,
 }
 
@@ -73,6 +74,7 @@ impl Agent {
             consolidating: Arc::new(Mutex::new(HashSet::new())),
             active_tasks: Arc::new(Mutex::new(HashMap::new())),
             session_locks: Arc::new(Mutex::new(HashMap::new())),
+            last_active_session: Arc::new(Mutex::new(None)),
             subagents: None,
         }
     }
@@ -142,6 +144,10 @@ impl Agent {
     async fn process_message(&self, msg: InboundMessage) -> PantherResult<Option<OutboundMessage>> {
         let session_key = msg.session_key();
         let InboundMessage { channel, sender_id: _, chat_id, content, media_path, image_b64, session_key_override: _ } = msg;
+
+        if channel != "heartbeat" && channel != "activity" {
+            *self.last_active_session.lock().await = Some((channel.clone(), chat_id.clone()));
+        }
 
         {
             let registry = self.registry.lock().await;

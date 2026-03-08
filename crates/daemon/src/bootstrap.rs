@@ -18,6 +18,7 @@ use agent::tools::capture::CaptureMediaTool;
 use agent::tools::send_file::SendFileTool;
 use agent::tools::clipboard::ClipboardTool;
 use agent::tools::system_info::SystemInfoTool;
+use agent::tools::activity::ActivityTool;
 use bot::{PantherBot, OutboundDispatcher};
 use bot::channels::{
     TelegramChannel, DiscordChannel,
@@ -36,6 +37,7 @@ use shared::events::EventBus;
 use skill_runner::SkillRunner;
 
 use crate::config::PantherConfig;
+use activity_tracker::{ActivityService, AlertFn};
 
 #[allow(dead_code)]
 pub struct PantherSystem {
@@ -50,6 +52,7 @@ pub struct PantherSystem {
     pub event_bus: EventBus,
     pub cron: CronService,
     pub heartbeat: Arc<HeartbeatService>,
+    pub activity_service: Option<Arc<ActivityService>>,
     pub config: PantherConfig,
     pub background_tasks: Vec<tokio::task::JoinHandle<()>>,
 }
@@ -265,6 +268,27 @@ pub async fn init(config: PantherConfig) -> PantherResult<PantherSystem> {
         }
     }
 
+    let activity_dir = dirs::home_dir()
+        .expect("Cannot determine home directory")
+        .join(".panther")
+        .join("workspace")
+        .join("activity");
+    tokio::fs::create_dir_all(&activity_dir).await?;
+
+    let activity_service = if config.activity_tracker.enabled {
+        Some(Arc::new(ActivityService::new(
+            activity_dir.clone(),
+            config.activity_tracker.poll_interval_secs,
+            config.activity_tracker.alert_threshold_mins,
+        )))
+    } else {
+        None
+    };
+
+    if let Some(ref svc) = activity_service {
+        registry.register(Box::new(ActivityTool::new(Arc::clone(&svc.analyzer))));
+    }
+
     let session_store = SessionStore::new(sessions_dir, config.tool_result_truncation);
     let context_builder = ContextBuilder::new(workspace.clone());
 
@@ -287,6 +311,21 @@ pub async fn init(config: PantherConfig) -> PantherResult<PantherSystem> {
     );
 
     *cron_agent_slot.lock().await = Some(Arc::clone(&agent));
+
+    if let Some(ref svc) = activity_service {
+        let alert_agent = Arc::clone(&agent);
+        let alert_fn: AlertFn = Arc::new(move |message| {
+            let agent = Arc::clone(&alert_agent);
+            Box::pin(async move {
+                let session = agent.last_active_session.lock().await.clone();
+                if let Some((channel, chat_id)) = session {
+                    let session_key = format!("activity:{}:{}", channel, chat_id);
+                    let _ = agent.dispatch_direct(session_key, channel, chat_id, message, None, None).await;
+                }
+            })
+        });
+        svc.set_alert(alert_fn).await;
+    }
 
     let announce_agent = Arc::clone(&agent);
     let announce_fn: AnnounceFn = Arc::new(move |channel, chat_id, content| {
@@ -364,6 +403,7 @@ pub async fn init(config: PantherConfig) -> PantherResult<PantherSystem> {
         event_bus,
         cron,
         heartbeat,
+        activity_service,
         config,
         background_tasks,
     })
@@ -385,7 +425,7 @@ async fn ensure_identity_files(workspace: &PathBuf) {
         ("SOUL.md", ""),
         ("USER.md", "# User\n\nAdd facts about yourself here. Panther will always remember these.\n"),
         ("AGENTS.md", "# Agents\n\nSubagents can be spawned for background tasks using the spawn tool.\n"),
-        ("TOOLS.md", "# Tools\n\n## Available Native Tools\n\n- **exec** — Run shell commands\n- **read_file** — Read a file\n- **write_file** — Write/create a file\n- **edit_file** — Edit a file (exact string replacement)\n- **list_dir** — List directory contents\n- **web_search** — Search the web via Brave API\n- **web_fetch** — Fetch a URL\n- **message** — Send a message mid-task\n- **read_skill** — Load full instructions for a named skill\n- **cron** — Schedule reminders and recurring tasks (add/list/remove)\n- **spawn** — Spawn a background subagent for complex long-running tasks\n"),
+        ("TOOLS.md", "# Tools\n\n## Available Native Tools\n\n- **exec** — Run shell commands\n- **read_file** — Read a file\n- **write_file** — Write/create a file\n- **edit_file** — Edit a file (exact string replacement)\n- **list_dir** — List directory contents\n- **web_search** — Search the web via Brave API\n- **web_fetch** — Fetch a URL\n- **message** — Send a message mid-task\n- **read_skill** — Load full instructions for a named skill\n- **cron** — Schedule reminders and recurring tasks (add/list/remove)\n- **spawn** — Spawn a background subagent for complex long-running tasks\n- **query_activity** — Query what the user is working on right now or has worked on in the past\n"),
         ("HEARTBEAT.md", "# Heartbeat\n\nList active background tasks here. Panther checks this file periodically.\n"),
     ];
 
@@ -395,5 +435,14 @@ async fn ensure_identity_files(workspace: &PathBuf) {
             let _ = tokio::fs::write(&path, content).await;
         }
     }
+
+    let skill_dir = workspace.join("skills").join("activity-tracker");
+    let skill_md = skill_dir.join("SKILL.md");
+    if !skill_md.exists() {
+        let _ = tokio::fs::create_dir_all(&skill_dir).await;
+        let _ = tokio::fs::write(&skill_md, ACTIVITY_TRACKER_SKILL_MD).await;
+    }
 }
+
+static ACTIVITY_TRACKER_SKILL_MD: &str = include_str!("../skills/activity-tracker/SKILL.md");
 

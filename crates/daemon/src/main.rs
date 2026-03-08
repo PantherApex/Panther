@@ -48,6 +48,7 @@ async fn main() {
         event_bus,
         cron,
         heartbeat,
+        activity_service,
         background_tasks: _background_tasks,
         ..
     } = system;
@@ -57,6 +58,11 @@ async fn main() {
 
     cron.start().await;
     heartbeat.clone().start().await;
+
+    if let Some(ref svc) = activity_service {
+        svc.clone().start().await;
+        eprintln!("[panther:activity] Activity tracker started.");
+    }
 
     let agent_clone = std::sync::Arc::clone(&agent);
     tokio::spawn(async move {
@@ -83,6 +89,9 @@ async fn main() {
 
     cron.stop().await;
     heartbeat.stop().await;
+    if let Some(ref svc) = activity_service {
+        svc.stop().await;
+    }
 
     println!("Panther stopped.");
 }

@@ -11,6 +11,7 @@ pub mod capture;
 pub mod send_file;
 pub mod clipboard;
 pub mod system_info;
+pub mod activity;
 
 use std::pin::Pin;
 use std::future::Future;

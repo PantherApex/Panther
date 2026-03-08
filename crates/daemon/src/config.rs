@@ -77,6 +77,26 @@ pub struct CliConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ActivityTrackerConfig {
+    #[serde(default = "default_activity_tracker_enabled")]
+    pub enabled: bool,
+    #[serde(default = "default_activity_poll_interval_secs")]
+    pub poll_interval_secs: u64,
+    #[serde(default = "default_activity_alert_threshold_mins")]
+    pub alert_threshold_mins: u64,
+}
+
+impl Default for ActivityTrackerConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_activity_tracker_enabled(),
+            poll_interval_secs: default_activity_poll_interval_secs(),
+            alert_threshold_mins: default_activity_alert_threshold_mins(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PantherConfig {
     pub telegram_token: String,
     pub active_provider: String,
@@ -133,6 +153,8 @@ pub struct PantherConfig {
     #[serde(default)]
     pub cli: CliConfig,
     #[serde(default)]
+    pub activity_tracker: ActivityTrackerConfig,
+    #[serde(default)]
     pub groq_transcription_key: String,
     #[serde(default = "default_transcription_model")]
     pub transcription_model: String,
@@ -176,6 +198,7 @@ impl PantherConfig {
             email: EmailConfig::default(),
             matrix: MatrixConfig::default(),
             cli: CliConfig::default(),
+            activity_tracker: ActivityTrackerConfig::default(),
             groq_transcription_key: String::new(),
             transcription_model: default_transcription_model(),
         }
@@ -238,6 +261,10 @@ fn config_path() -> PantherResult<std::path::PathBuf> {
         .map(|h| h.join(".panther").join("config.toml"))
         .ok_or_else(|| PantherError::ConfigError("Cannot determine home directory".into()))
 }
+
+fn default_activity_tracker_enabled() -> bool { true }
+fn default_activity_poll_interval_secs() -> u64 { 30 }
+fn default_activity_alert_threshold_mins() -> u64 { 120 }
 
 fn default_max_iterations() -> usize { 40 }
 fn default_max_tokens() -> u32 { 8096 }
